@@ -1,0 +1,11 @@
+paths:
+  db_path: ./data/taxi.db
+  model_path: ./models/taxi.model
+  model_custom_path: ./models/taxi_custom.model
+
+ml:
+  random_state: 42
+  test_size: 0.30
+
+data:
+  source_url: https://github.com/eishkina-estia/ML2023/raw/main/data/New_York_City_Taxi_Trip_Duration.zip
