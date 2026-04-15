@@ -3,6 +3,7 @@ import os
 import sys
 import dill
 import pickle
+import hashlib
 from math import asin, cos, radians, sin, sqrt
 
 import pandas as pd
@@ -25,8 +26,35 @@ MIN_TRIP_DISTANCE_METERS = 50.0
 app = FastAPI()
 
 
+def _ensure_model_registry_table():
+    """Crée la table des métadonnées de modèles si elle n'existe pas déjà."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_registry (
+                model_name TEXT PRIMARY KEY,
+                model_version TEXT NOT NULL,
+                model_path TEXT NOT NULL,
+                model_file_mtime TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_model_registry_version_path
+            ON model_registry(model_version, model_path)
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 def _ensure_predictions_table():
-    """Crée la table de logs de prédiction si elle n'existe pas déjà."""
+    """Crée la table de logs de prédiction si elle n'existe pas déjà et applique les migrations utiles."""
     con = sqlite3.connect(DB_PATH)
     try:
         con.execute(
@@ -34,6 +62,7 @@ def _ensure_predictions_table():
             CREATE TABLE IF NOT EXISTS prediction_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL DEFAULT 'unknown',
                 vendor_id INTEGER NOT NULL,
                 pickup_datetime TEXT NOT NULL,
                 passenger_count INTEGER NOT NULL,
@@ -47,12 +76,76 @@ def _ensure_predictions_table():
             )
             """
         )
+
+        # Migration douce: ajoute model_version si la table existait déjà sans cette colonne.
+        cols = con.execute("PRAGMA table_info(prediction_logs)").fetchall()
+        col_names = {col[1] for col in cols}
+        if "model_version" not in col_names:
+            con.execute(
+                "ALTER TABLE prediction_logs ADD COLUMN model_version TEXT NOT NULL DEFAULT 'unknown'"
+            )
+
         con.commit()
     finally:
         con.close()
 
 
-def _save_prediction(trip, prediction: float, model_name: str):
+def _hash_file(path: str) -> str:
+    """Calcule un hash court du fichier modèle pour versionner les artefacts locaux."""
+    sha256 = hashlib.sha256()
+    with open(path, "rb") as model_bin:
+        for chunk in iter(lambda: model_bin.read(1024 * 1024), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()[:12]
+
+
+def _build_model_metadata(model_name: str, model_path: str) -> dict:
+    """Construit les métadonnées persistées d'un modèle local."""
+    file_mtime = os.path.getmtime(model_path)
+    file_mtime_iso = pd.to_datetime(file_mtime, unit="s", utc=True).isoformat()
+    file_hash = _hash_file(model_path)
+    model_version = f"{model_name}-{file_hash}"
+    return {
+        "model_name": model_name,
+        "model_version": model_version,
+        "model_path": model_path,
+        "model_file_mtime": file_mtime_iso,
+    }
+
+
+def _upsert_model_metadata(model_metadata: dict):
+    """Insère ou met à jour les métadonnées du modèle dans model_registry."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            """
+            INSERT INTO model_registry (
+                model_name,
+                model_version,
+                model_path,
+                model_file_mtime,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(model_name) DO UPDATE SET
+                model_version=excluded.model_version,
+                model_path=excluded.model_path,
+                model_file_mtime=excluded.model_file_mtime,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                model_metadata["model_name"],
+                model_metadata["model_version"],
+                model_metadata["model_path"],
+                model_metadata["model_file_mtime"],
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _save_prediction(trip, prediction: float, model_name: str, model_version: str):
     """Enregistre une prédiction et les features d'entrée dans SQLite."""
     con = sqlite3.connect(DB_PATH)
     try:
@@ -60,6 +153,7 @@ def _save_prediction(trip, prediction: float, model_name: str):
             """
             INSERT INTO prediction_logs (
                 model_name,
+                model_version,
                 vendor_id,
                 pickup_datetime,
                 passenger_count,
@@ -69,10 +163,11 @@ def _save_prediction(trip, prediction: float, model_name: str):
                 dropoff_latitude,
                 store_and_fwd_flag,
                 prediction
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 model_name,
+                model_version,
                 trip.vendor_id,
                 trip.pickup_datetime,
                 trip.passenger_count,
@@ -89,14 +184,22 @@ def _save_prediction(trip, prediction: float, model_name: str):
         con.close()
 
 print(f"Loading the model from {MODEL_PATH}")
-with open(MODEL_PATH, "rb") as file:
-    model = pickle.load(file)
+with open(MODEL_PATH, "rb") as model_file:
+    model = pickle.load(model_file)
 
 print(f"Loading the custom model from {MODEL_CUSTOM_PATH}")
-with open(MODEL_CUSTOM_PATH, "rb") as file:
-    model_custom = dill.load(file)
+with open(MODEL_CUSTOM_PATH, "rb") as custom_model_file:
+    model_custom = dill.load(custom_model_file)
 
+_ensure_model_registry_table()
 _ensure_predictions_table()
+
+MODEL_METADATA = {
+    "main": _build_model_metadata("main", MODEL_PATH),
+    "custom": _build_model_metadata("custom", MODEL_CUSTOM_PATH),
+}
+for model_meta in MODEL_METADATA.values():
+    _upsert_model_metadata(model_meta)
 
 
 class Trip(BaseModel):
@@ -163,7 +266,12 @@ def predict(trip: Trip):
     """Prédit la durée du trajet avec le modèle principal à partir des données d'entrée."""
     input_data = pd.DataFrame([trip.model_dump()])
     result = model.predict(input_data)[0]
-    _save_prediction(trip, float(result), "main")
+    _save_prediction(
+        trip,
+        float(result),
+        "main",
+        MODEL_METADATA["main"]["model_version"],
+    )
     return {"result": float(result)}
 
 
@@ -172,8 +280,41 @@ def predict_custom(trip: Trip):
     """Prédit la durée avec le modèle custom, puis convertit le résultat en entier."""
     input_data = pd.DataFrame([trip.model_dump()])
     result = model_custom.predict(input_data)[0]
-    _save_prediction(trip, float(result), "custom")
+    _save_prediction(
+        trip,
+        float(result),
+        "custom",
+        MODEL_METADATA["custom"]["model_version"],
+    )
     return {"result": int(result)}
+
+
+@app.get("/models/metadata")
+def get_models_metadata():
+    """Retourne les métadonnées persistées des modèles chargés."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql(
+            """
+            SELECT
+                model_name,
+                model_version,
+                model_path,
+                model_file_mtime,
+                created_at,
+                updated_at
+            FROM model_registry
+            ORDER BY model_name ASC
+            """,
+            con,
+        )
+    finally:
+        con.close()
+
+    return {
+        "count": int(len(df)),
+        "items": df.to_dict(orient="records"),
+    }
 
 
 @app.get("/predictions/recent")
@@ -197,6 +338,7 @@ def get_recent_predictions(limit: int = 20, model_name: str | None = None):
                 SELECT
                     id,
                     model_name,
+                    model_version,
                     vendor_id,
                     pickup_datetime,
                     passenger_count,
@@ -221,6 +363,7 @@ def get_recent_predictions(limit: int = 20, model_name: str | None = None):
                 SELECT
                     id,
                     model_name,
+                    model_version,
                     vendor_id,
                     pickup_datetime,
                     passenger_count,
