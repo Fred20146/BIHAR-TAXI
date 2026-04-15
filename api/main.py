@@ -43,11 +43,13 @@ class Trip(BaseModel):
 
 @app.get("/")
 def root():
+    """Vérifie que l'API est disponible et renvoie un statut de santé."""
     return {"status": "ok", "service": "bihar-taxi-api"}
 
 
 @app.post("/predict")
 def predict(trip: Trip):
+    """Prédit la durée du trajet avec le modèle principal à partir des données d'entrée."""
     input_data = pd.DataFrame([trip.model_dump()])
     result = model.predict(input_data)[0]
     return {"result": float(result)}
@@ -55,6 +57,7 @@ def predict(trip: Trip):
 
 @app.post("/predict_custom")
 def predict_custom(trip: Trip):
+    """Prédit la durée avec le modèle custom, puis convertit le résultat en entier."""
     input_data = pd.DataFrame([trip.model_dump()])
     result = model_custom.predict(input_data)[0]
     return {"result": int(result)}
@@ -62,6 +65,7 @@ def predict_custom(trip: Trip):
 
 @app.get("/trips/randomtest")
 def get_random_test_trip():
+    """Récupère un trajet aléatoire depuis la table test avec sa cible réelle."""
     print(f"Reading random test data from the database: {DB_PATH}")
     con = sqlite3.connect(DB_PATH)
     try:
