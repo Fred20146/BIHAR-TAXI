@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 from datetime import datetime
 from math import log2
 from math import asin, cos, radians, sin, sqrt
@@ -7,6 +8,9 @@ from math import asin, cos, radians, sin, sqrt
 import pydeck as pdk
 import requests
 import streamlit as st
+import numpy as np
+import pandas as pd
+import yaml
 
 
 CANDIDATE_API_URLS = [
@@ -20,6 +24,21 @@ NYC_MIN_LONGITUDE = -74.30
 NYC_MAX_LONGITUDE = -73.65
 NYC_MIN_LATITUDE = 40.45
 NYC_MAX_LATITUDE = 41.05
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.normpath(os.path.join(ROOT_DIR, ".."))
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.yml")
+
+CSV_REQUIRED_COLUMNS = [
+    "vendor_id",
+    "pickup_datetime",
+    "passenger_count",
+    "pickup_longitude",
+    "pickup_latitude",
+    "dropoff_longitude",
+    "dropoff_latitude",
+    "store_and_fwd_flag",
+]
 
 
 st.set_page_config(page_title="BIHAR-TAXI Predictor", page_icon="🚕", layout="wide")
@@ -260,6 +279,66 @@ def predict_with_fallback(api_base_url: str, endpoint_path: str, request_payload
         raise
 
 
+@st.cache_data(ttl=60)
+def get_db_path() -> str:
+    """Résout le chemin de la base SQLite à partir du fichier de configuration."""
+    with open(CONFIG_PATH, "r", encoding="utf-8") as file:
+        config_data = yaml.safe_load(file)
+    rel_path = config_data["paths"]["db_path"]
+    return os.path.normpath(os.path.join(PROJECT_ROOT, rel_path))
+
+
+@st.cache_data(ttl=60)
+def load_distribution_data() -> tuple[pd.Series, pd.Series, str]:
+    """Charge la distribution train et la distribution des prédictions persistées."""
+    sqlite_db_path = get_db_path()
+    con = sqlite3.connect(sqlite_db_path)
+    try:
+        train_series = pd.read_sql("SELECT trip_duration FROM train", con)["trip_duration"].astype(float)
+        try:
+            pred_series = pd.read_sql("SELECT prediction FROM prediction_logs", con)["prediction"].astype(float)
+        except (sqlite3.OperationalError, KeyError, ValueError):
+            pred_series = pd.Series(dtype=float)
+    finally:
+        con.close()
+
+    return train_series, pred_series, sqlite_db_path
+
+
+def build_histogram(values: pd.Series, bin_edges: np.ndarray) -> pd.DataFrame:
+    """Construit une table histogramme compatible avec st.bar_chart."""
+    if values.empty:
+        return pd.DataFrame({"count": []})
+
+    clean = values.replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+    if clean.empty:
+        return pd.DataFrame({"count": []})
+
+    counts, edges = np.histogram(clean, bins=bin_edges)
+    labels = [f"{int(edges[i])}-{int(edges[i + 1])}" for i in range(len(edges) - 1)]
+    return pd.DataFrame({"count": counts}, index=labels)
+
+
+def validate_csv_schema(frame: pd.DataFrame) -> tuple[bool, list[str]]:
+    """Vérifie la présence des colonnes obligatoires pour la prédiction batch."""
+    missing_columns = [col for col in CSV_REQUIRED_COLUMNS if col not in frame.columns]
+    return len(missing_columns) == 0, missing_columns
+
+
+def normalize_csv_payload(frame: pd.DataFrame) -> list[dict]:
+    """Convertit un DataFrame CSV en payload JSON prêt pour /predict_batch."""
+    normalized = frame[CSV_REQUIRED_COLUMNS].copy()
+    normalized["vendor_id"] = normalized["vendor_id"].astype(int)
+    normalized["passenger_count"] = normalized["passenger_count"].astype(int)
+    normalized["pickup_longitude"] = normalized["pickup_longitude"].astype(float)
+    normalized["pickup_latitude"] = normalized["pickup_latitude"].astype(float)
+    normalized["dropoff_longitude"] = normalized["dropoff_longitude"].astype(float)
+    normalized["dropoff_latitude"] = normalized["dropoff_latitude"].astype(float)
+    normalized["pickup_datetime"] = normalized["pickup_datetime"].astype(str)
+    normalized["store_and_fwd_flag"] = normalized["store_and_fwd_flag"].astype(str)
+    return normalized.to_dict(orient="records")
+
+
 st.markdown(
     """
     <div class="hero">
@@ -271,6 +350,12 @@ st.markdown(
 )
 
 with st.sidebar:
+    current_page = st.radio(
+        "Navigation",
+        options=["Prédiction", "Statistiques"],
+        index=0,
+    )
+
     st.header("Configuration")
     default_api_url = os.getenv("BIHAR_TAXI_API_URL", "http://127.0.0.1:8001")
     api_url = st.text_input("URL de l'API FastAPI", value=default_api_url)
@@ -296,6 +381,11 @@ with st.sidebar:
             index=0,
             help="Si vous gardez 'latest', l'API sélectionne la version la plus récente disponible.",
         )
+        model_name_by_version = {
+            item.get("model_version"): item.get("model_name")
+            for item in model_metadata["items"]
+            if item.get("model_version")
+        }
     else:
         model_version = st.text_input(
             "model_version",
@@ -303,190 +393,330 @@ with st.sidebar:
             help="Laissez vide pour utiliser la dernière version disponible.",
         )
         model_version = model_version.strip() or None
+        model_name_by_version = {}
 
     st.divider()
     if not model_metadata:
         st.caption("Métadonnées modèles indisponibles actuellement.")
 
-col1, col2 = st.columns([1.1, 0.9], gap="large")
+if current_page == "Prédiction":
+    col1, col2 = st.columns([1.1, 0.9], gap="large")
 
-with col1:
-    st.subheader("Entrée de prédiction")
-    vendor_id = st.selectbox("vendor_id", options=[1, 2], index=0)
+    with col1:
+        st.subheader("Entrée de prédiction")
+        vendor_id = st.selectbox("vendor_id", options=[1, 2], index=0)
 
-    now = datetime.now()
-    st.markdown("**pickup_datetime**")
-    date_col, hour_col, minute_col = st.columns([2.6, 1, 1])
-    with date_col:
-        pickup_date = st.date_input("Date", value=now.date(), label_visibility="collapsed")
-    with hour_col:
-        pickup_hour = st.selectbox(
-            "Heure",
-            options=list(range(24)),
-            index=now.hour,
-            format_func=lambda value: f"{value:02d}",
-            label_visibility="collapsed",
-        )
-    with minute_col:
-        pickup_minute = st.selectbox(
-            "Minute",
-            options=list(range(60)),
-            index=now.minute,
-            format_func=lambda value: f"{value:02d}",
-            label_visibility="collapsed",
-        )
-
-    pickup_datetime = f"{pickup_date:%Y-%m-%d} {pickup_hour:02d}:{pickup_minute:02d}:00"
-    passenger_count = st.slider("passenger_count", min_value=0, max_value=9, value=1, step=1)
-    pickup_longitude = st.slider(
-        "pickup_longitude",
-        min_value=NYC_MIN_LONGITUDE,
-        max_value=NYC_MAX_LONGITUDE,
-        value=-73.98,
-        step=0.0001,
-        format="%.4f",
-    )
-    pickup_latitude = st.slider(
-        "pickup_latitude",
-        min_value=NYC_MIN_LATITUDE,
-        max_value=NYC_MAX_LATITUDE,
-        value=40.75,
-        step=0.0001,
-        format="%.4f",
-    )
-    dropoff_longitude = st.slider(
-        "dropoff_longitude",
-        min_value=NYC_MIN_LONGITUDE,
-        max_value=NYC_MAX_LONGITUDE,
-        value=-73.96,
-        step=0.0001,
-        format="%.4f",
-    )
-    dropoff_latitude = st.slider(
-        "dropoff_latitude",
-        min_value=NYC_MIN_LATITUDE,
-        max_value=NYC_MAX_LATITUDE,
-        value=40.77,
-        step=0.0001,
-        format="%.4f",
-    )
-    store_and_fwd_flag = st.selectbox("store_and_fwd_flag", options=["N", "Y"], index=0)
-
-    submitted = st.button("Prédire", type="primary")
-
-    st.markdown('<p class="small-note">Astuce: gardez une distance pickup/dropoff supérieure à 50 m pour passer la validation API.</p>', unsafe_allow_html=True)
-
-with col2:
-    st.subheader("Résultat")
-    trip_distance_m = haversine_meters(
-        float(pickup_latitude),
-        float(pickup_longitude),
-        float(dropoff_latitude),
-        float(dropoff_longitude),
-    )
-    trip_distance_display = format_distance(trip_distance_m)
-
-    if submitted:
-        request_body = {
-            "vendor_id": int(vendor_id),
-            "pickup_datetime": pickup_datetime,
-            "passenger_count": int(passenger_count),
-            "pickup_longitude": float(pickup_longitude),
-            "pickup_latitude": float(pickup_latitude),
-            "dropoff_longitude": float(dropoff_longitude),
-            "dropoff_latitude": float(dropoff_latitude),
-            "store_and_fwd_flag": store_and_fwd_flag,
-        }
-
-        query = {}
-        if model_version and model_version != "latest":
-            query["model_version"] = model_version
-
-        if trip_distance_m <= 50:
-            st.markdown(
-                """
-                <div class="validation-card">
-                    <strong>Validation entrée</strong><br>
-                    La distance de la course ne peut être inférieure à 50 m.
-                </div>
-                """,
-                unsafe_allow_html=True,
+        now = datetime.now()
+        st.markdown("**pickup_datetime**")
+        date_col, hour_col, minute_col = st.columns([2.6, 1, 1])
+        with date_col:
+            pickup_date = st.date_input("Date", value=now.date(), label_visibility="collapsed")
+        with hour_col:
+            pickup_hour = st.selectbox(
+                "Heure",
+                options=list(range(24)),
+                index=now.hour,
+                format_func=lambda value: f"{value:02d}",
+                label_visibility="collapsed",
             )
-            st.caption(f"Distance calculée: {trip_distance_display}")
-        else:
-            path = "/predict"
-            if query:
-                from urllib.parse import urlencode
+        with minute_col:
+            pickup_minute = st.selectbox(
+                "Minute",
+                options=list(range(60)),
+                index=now.minute,
+                format_func=lambda value: f"{value:02d}",
+                label_visibility="collapsed",
+            )
 
-                path = f"{path}?{urlencode(query)}"
+        pickup_datetime = f"{pickup_date:%Y-%m-%d} {pickup_hour:02d}:{pickup_minute:02d}:00"
+        passenger_count = st.slider("passenger_count", min_value=0, max_value=9, value=1, step=1)
+        pickup_longitude = st.slider(
+            "pickup_longitude",
+            min_value=NYC_MIN_LONGITUDE,
+            max_value=NYC_MAX_LONGITUDE,
+            value=-73.98,
+            step=0.0001,
+            format="%.4f",
+        )
+        pickup_latitude = st.slider(
+            "pickup_latitude",
+            min_value=NYC_MIN_LATITUDE,
+            max_value=NYC_MAX_LATITUDE,
+            value=40.75,
+            step=0.0001,
+            format="%.4f",
+        )
+        dropoff_longitude = st.slider(
+            "dropoff_longitude",
+            min_value=NYC_MIN_LONGITUDE,
+            max_value=NYC_MAX_LONGITUDE,
+            value=-73.96,
+            step=0.0001,
+            format="%.4f",
+        )
+        dropoff_latitude = st.slider(
+            "dropoff_latitude",
+            min_value=NYC_MIN_LATITUDE,
+            max_value=NYC_MAX_LATITUDE,
+            value=40.77,
+            step=0.0001,
+            format="%.4f",
+        )
+        store_and_fwd_flag = st.selectbox("store_and_fwd_flag", options=["N", "Y"], index=0)
 
-            try:
-                api_response, used_api_url = predict_with_fallback(api_url, path, request_body)
-                if used_api_url != api_url:
-                    st.session_state["detected_api_url"] = used_api_url
-                    st.info(f"API indisponible sur {api_url}. Bascule automatique sur {used_api_url}.")
-                display_model_version = api_response.get("model_version", "non fourni par l'API")
+        submitted = st.button("Prédire", type="primary")
+
+        st.markdown('<p class="small-note">Astuce: gardez une distance pickup/dropoff supérieure à 50 m pour passer la validation API.</p>', unsafe_allow_html=True)
+
+    with col2:
+        st.subheader("Résultat")
+        trip_distance_m = haversine_meters(
+            float(pickup_latitude),
+            float(pickup_longitude),
+            float(dropoff_latitude),
+            float(dropoff_longitude),
+        )
+        trip_distance_display = format_distance(trip_distance_m)
+
+        if submitted:
+            request_body = {
+                "vendor_id": int(vendor_id),
+                "pickup_datetime": pickup_datetime,
+                "passenger_count": int(passenger_count),
+                "pickup_longitude": float(pickup_longitude),
+                "pickup_latitude": float(pickup_latitude),
+                "dropoff_longitude": float(dropoff_longitude),
+                "dropoff_latitude": float(dropoff_latitude),
+                "store_and_fwd_flag": store_and_fwd_flag,
+            }
+
+            query = {}
+            if model_version and model_version != "latest":
+                query["model_version"] = model_version
+
+            if trip_distance_m <= 50:
                 st.markdown(
-                    f"""
-                    <div class="metric-card">
-                        <h3 style="margin-top:0; margin-bottom:0.4rem;">Prédiction reçue</h3>
-                        <p class="metric-value"><strong>Durée estimée:</strong> {format_seconds_hms(api_response['result'])}</p>
-                        <p class="metric-label"><strong>Distance estimée:</strong> {trip_distance_display}</p>
-                        <p class="metric-label"><strong>Version du modèle:</strong> {display_model_version}</p>
+                    """
+                    <div class="validation-card">
+                        <strong>Validation entrée</strong><br>
+                        La distance de la course ne peut être inférieure à 50 m.
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
-                st.caption("Réponse brute de l'API")
-                st.json(api_response)
-            except requests.exceptions.HTTPError as error:
-                response = error.response
-                status_code = response.status_code if response is not None else 500
-                detail_message = "Entrée invalide. Vérifiez les coordonnées et la distance minimale de 50 m."
-                if response is not None:
-                    try:
-                        payload = response.json()
-                        if isinstance(payload, dict) and payload.get("detail"):
-                            detail_message = str(payload.get("detail"))
-                    except ValueError:
-                        if response.text:
-                            detail_message = response.text
-                st.error(f"Erreur API ({status_code})")
-                st.warning(detail_message)
-            except requests.exceptions.RequestException as error:
-                st.error("Impossible de joindre l'API configurée et aucune API locale n'a été trouvée.")
-                st.code(str(error))
-                st.caption("Conseil: vérifiez le port de l'API dans la sidebar ou cliquez sur 'Auto-détecter API locale'.")
-    else:
-        st.info("Renseignez les champs: la carte ci-dessous se met à jour en temps réel. Cliquez sur Prédire pour lancer l'inférence.")
+                st.caption(f"Distance calculée: {trip_distance_display}")
+            else:
+                path = "/predict"
+                if query:
+                    from urllib.parse import urlencode
+
+                    path = f"{path}?{urlencode(query)}"
+
+                try:
+                    api_response, used_api_url = predict_with_fallback(api_url, path, request_body)
+                    if used_api_url != api_url:
+                        st.session_state["detected_api_url"] = used_api_url
+                        st.info(f"API indisponible sur {api_url}. Bascule automatique sur {used_api_url}.")
+                    display_model_version = api_response.get("model_version", "non fourni par l'API")
+                    display_model_name = model_name_by_version.get(display_model_version)
+                    if not display_model_name and isinstance(display_model_version, str) and "-" in display_model_version:
+                        display_model_name = display_model_version.split("-", 1)[0]
+                    if not display_model_name:
+                        display_model_name = "non fourni par l'API"
+                    st.markdown(
+                        f"""
+                        <div class="metric-card">
+                            <h3 style="margin-top:0; margin-bottom:0.4rem;">Prédiction reçue</h3>
+                            <p class="metric-value"><strong>Durée estimée:</strong> {format_seconds_hms(api_response['result'])}</p>
+                            <p class="metric-label"><strong>Distance estimée:</strong> {trip_distance_display}</p>
+                            <p class="metric-label"><strong>Nom du modèle:</strong> {display_model_name}</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.caption("Réponse brute de l'API")
+                    st.json(api_response)
+                except requests.exceptions.HTTPError as error:
+                    response = error.response
+                    status_code = response.status_code if response is not None else 500
+                    detail_message = "Entrée invalide. Vérifiez les coordonnées et la distance minimale de 50 m."
+                    if response is not None:
+                        try:
+                            payload = response.json()
+                            if isinstance(payload, dict) and payload.get("detail"):
+                                detail_message = str(payload.get("detail"))
+                        except ValueError:
+                            if response.text:
+                                detail_message = response.text
+                    st.error(f"Erreur API ({status_code})")
+                    st.warning(detail_message)
+                except requests.exceptions.RequestException as error:
+                    st.error("Impossible de joindre l'API configurée et aucune API locale n'a été trouvée.")
+                    st.code(str(error))
+                    st.caption("Conseil: vérifiez le port de l'API dans la sidebar ou cliquez sur 'Auto-détecter API locale'.")
+        else:
+            st.info("Renseignez les champs: la carte ci-dessous se met à jour en temps réel. Cliquez sur Prédire pour lancer l'inférence.")
+
+        st.divider()
+        st.subheader("Carte du trajet sélectionné")
+        st.caption(f"Distance actuelle: {trip_distance_display}")
+        trip_deck = build_trip_deck(
+            float(pickup_latitude),
+            float(pickup_longitude),
+            float(dropoff_latitude),
+            float(dropoff_longitude),
+        )
+        st.pydeck_chart(trip_deck, use_container_width=True)
+        st.caption("La carte suit en direct les valeurs des sliders (pickup/dropoff). Points non déplaçables.")
 
     st.divider()
-    st.subheader("Carte du trajet sélectionné")
-    st.caption(f"Distance actuelle: {trip_distance_display}")
-    trip_deck = build_trip_deck(
-        float(pickup_latitude),
-        float(pickup_longitude),
-        float(dropoff_latitude),
-        float(dropoff_longitude),
+    st.subheader("Exemple de charge utile")
+    st.code(
+        json.dumps(
+            {
+                "vendor_id": 1,
+                "pickup_datetime": "2016-06-01 11:07:08",
+                "passenger_count": 1,
+                "pickup_longitude": -73.97777557373047,
+                "pickup_latitude": 40.76396560668945,
+                "dropoff_longitude": -73.96023559570312,
+                "dropoff_latitude": 40.77887725830078,
+                "store_and_fwd_flag": "N",
+            },
+            indent=2,
+        ),
+        language="json",
     )
-    st.pydeck_chart(trip_deck, use_container_width=True)
-    st.caption("La carte suit en direct les valeurs des sliders (pickup/dropoff). Points non déplaçables.")
 
-st.divider()
-st.subheader("Exemple de charge utile")
-st.code(
-    json.dumps(
-        {
-            "vendor_id": 1,
-            "pickup_datetime": "2016-06-01 11:07:08",
-            "passenger_count": 1,
-            "pickup_longitude": -73.97777557373047,
-            "pickup_latitude": 40.76396560668945,
-            "dropoff_longitude": -73.96023559570312,
-            "dropoff_latitude": 40.77887725830078,
-            "store_and_fwd_flag": "N",
-        },
-        indent=2,
-    ),
-    language="json",
-)
+    st.divider()
+    st.subheader("Prédiction batch par CSV")
+    st.caption("Importez un CSV avec les mêmes colonnes que le payload single prediction.")
+
+    uploaded_csv = st.file_uploader(
+        "Fichier CSV",
+        type=["csv"],
+        accept_multiple_files=False,
+        key="batch_csv_uploader",
+    )
+
+    if uploaded_csv is not None:
+        try:
+            csv_frame = pd.read_csv(uploaded_csv)
+        except pd.errors.ParserError as csv_error:
+            st.error("Le fichier CSV n'a pas pu être lu.")
+            st.code(str(csv_error))
+            csv_frame = None
+
+        if csv_frame is not None:
+            is_valid_schema, missing_cols = validate_csv_schema(csv_frame)
+            if not is_valid_schema:
+                st.error("Le CSV ne contient pas toutes les colonnes requises.")
+                st.write("Colonnes manquantes:", missing_cols)
+                st.write("Colonnes attendues:", CSV_REQUIRED_COLUMNS)
+            elif csv_frame.empty:
+                st.warning("Le CSV est vide.")
+            else:
+                st.write(f"Lignes détectées: {len(csv_frame)}")
+                st.dataframe(csv_frame.head(10), use_container_width=True)
+
+                if st.button("Lancer la prédiction batch", key="run_batch_csv"):
+                    try:
+                        batch_trips = normalize_csv_payload(csv_frame)
+                        batch_query = {}
+                        if model_version and model_version != "latest":
+                            batch_query["model_version"] = model_version
+
+                        batch_path = "/predict_batch"
+                        if batch_query:
+                            from urllib.parse import urlencode
+
+                            batch_path = f"{batch_path}?{urlencode(batch_query)}"
+
+                        batch_payload = {"trips": batch_trips}
+                        batch_response, used_batch_api_url = predict_with_fallback(api_url, batch_path, batch_payload)
+                        if used_batch_api_url != api_url:
+                            st.session_state["detected_api_url"] = used_batch_api_url
+                            st.info(f"API indisponible sur {api_url}. Bascule automatique sur {used_batch_api_url}.")
+
+                        predictions = batch_response.get("predictions", [])
+                        batch_model_version = batch_response.get("model_version", "non fourni par l'API")
+
+                        if len(predictions) != len(csv_frame):
+                            st.warning("Le nombre de prédictions retournées ne correspond pas au nombre de lignes du CSV.")
+
+                        result_frame = csv_frame.copy()
+                        result_frame["predicted_trip_duration_sec"] = pd.Series(predictions)
+                        result_frame["predicted_trip_duration_hms"] = result_frame["predicted_trip_duration_sec"].apply(
+                            lambda seconds: format_seconds_hms(float(seconds)) if pd.notna(seconds) else ""
+                        )
+
+                        st.success("Prédiction batch terminée.")
+                        st.write(f"Version du modèle: {batch_model_version}")
+                        st.dataframe(result_frame.head(50), use_container_width=True)
+
+                        csv_output_bytes = result_frame.to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            label="Télécharger les résultats CSV",
+                            data=csv_output_bytes,
+                            file_name="predictions_batch_results.csv",
+                            mime="text/csv",
+                            key="download_batch_csv",
+                        )
+                    except requests.exceptions.HTTPError as batch_http_error:
+                        response = batch_http_error.response
+                        status_code = response.status_code if response is not None else 500
+                        detail_message = "Erreur lors de la prédiction batch. Vérifiez le format des données."
+                        if response is not None:
+                            try:
+                                payload = response.json()
+                                if isinstance(payload, dict) and payload.get("detail"):
+                                    detail_message = str(payload.get("detail"))
+                            except ValueError:
+                                if response.text:
+                                    detail_message = response.text
+                        st.error(f"Erreur API ({status_code})")
+                        st.warning(detail_message)
+                    except requests.exceptions.RequestException as batch_req_error:
+                        st.error("Impossible de joindre l'API pour la prédiction batch.")
+                        st.code(str(batch_req_error))
+
+else:
+    st.subheader("Statistiques des distributions")
+    train_values, pred_values, db_path = load_distribution_data()
+
+    st.caption(f"Source des données: {db_path}")
+    st.caption("Comparaison entre la distribution des `trip_duration` d'entraînement et les valeurs prédites persistées.")
+
+    if train_values.empty:
+        st.warning("Aucune donnée d'entraînement trouvée dans la base SQLite.")
+    else:
+        train_clean = train_values.replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+        pred_clean = pred_values.replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+
+        combined = train_clean.copy()
+        if not pred_clean.empty:
+            combined = pd.concat([combined, pred_clean], ignore_index=True)
+
+        upper = float(np.percentile(combined, 99)) if not combined.empty else 1000.0
+        upper = max(upper, 60.0)
+        bins = np.linspace(0.0, upper, 36)
+
+        train_hist = build_histogram(train_clean, bins)
+        pred_hist = build_histogram(pred_clean, bins)
+
+        metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+        metrics_col1.metric("Samples train", f"{len(train_clean):,}".replace(",", " "))
+        metrics_col2.metric("Samples prédits", f"{len(pred_clean):,}".replace(",", " "))
+        mean_pred = float(pred_clean.mean()) if not pred_clean.empty else 0.0
+        metrics_col3.metric("Moyenne prédictions", f"{mean_pred:.1f} sec")
+
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            st.markdown("**Distribution d'entraînement (`train.trip_duration`)**")
+            st.bar_chart(train_hist)
+        with chart_col2:
+            st.markdown("**Distribution des valeurs prédites (`prediction_logs.prediction`)**")
+            if pred_hist.empty:
+                st.info("Aucune prédiction persistée pour l'instant. Lancez quelques inférences pour alimenter l'histogramme.")
+            else:
+                st.bar_chart(pred_hist)
