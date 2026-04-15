@@ -8,7 +8,7 @@ from math import asin, cos, radians, sin, sqrt
 
 import pandas as pd
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Body, FastAPI, HTTPException, Query
 from pydantic import BaseModel, field_validator, model_validator
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -201,6 +201,37 @@ MODEL_METADATA = {
 for model_meta in MODEL_METADATA.values():
     _upsert_model_metadata(model_meta)
 
+LOADED_MODELS_BY_VERSION = {
+    MODEL_METADATA["main"]["model_version"]: {
+        "model_name": "main",
+        "model": model,
+    },
+    MODEL_METADATA["custom"]["model_version"]: {
+        "model_name": "custom",
+        "model": model_custom,
+    },
+}
+LATEST_MODEL_VERSION = max(
+    MODEL_METADATA.values(),
+    key=lambda meta: meta["model_file_mtime"],
+)["model_version"]
+
+
+def _resolve_model_by_version(model_version: str | None):
+    """Résout le modèle à utiliser à partir d'une version explicite ou de la version la plus récente."""
+    version = model_version or LATEST_MODEL_VERSION
+    selected = LOADED_MODELS_BY_VERSION.get(version)
+    if selected is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "model_version introuvable",
+                "requested_model_version": version,
+                "available_model_versions": sorted(LOADED_MODELS_BY_VERSION.keys()),
+            },
+        )
+    return selected, version
+
 
 class Trip(BaseModel):
     vendor_id: int
@@ -255,6 +286,10 @@ class Trip(BaseModel):
         return self
 
 
+class BatchTripRequest(BaseModel):
+    trips: list[Trip]
+
+
 @app.get("/")
 def root():
     """Vérifie que l'API est disponible et renvoie un statut de santé."""
@@ -262,17 +297,102 @@ def root():
 
 
 @app.post("/predict")
-def predict(trip: Trip):
-    """Prédit la durée du trajet avec le modèle principal à partir des données d'entrée."""
+def predict(
+    trip: Trip = Body(
+        ...,
+        example={
+            "vendor_id": 1,
+            "pickup_datetime": "2016-06-01 11:07:08",
+            "passenger_count": 1,
+            "pickup_longitude": -73.97777557373047,
+            "pickup_latitude": 40.76396560668945,
+            "dropoff_longitude": -73.96023559570312,
+            "dropoff_latitude": 40.77887725830078,
+            "store_and_fwd_flag": "N",
+        },
+    ),
+    model_version: str | None = Query(
+        default=None,
+        description="Version du modèle à utiliser. Si absent, la dernière version disponible est utilisée.",
+        examples=["main-2555f607071b", "custom-8833f727d970"],
+    ),
+):
+    """Prédit la durée d'un trajet et renvoie aussi la version du modèle utilisée."""
+    selected, resolved_model_version = _resolve_model_by_version(model_version)
     input_data = pd.DataFrame([trip.model_dump()])
-    result = model.predict(input_data)[0]
+    result = selected["model"].predict(input_data)[0]
     _save_prediction(
         trip,
         float(result),
-        "main",
-        MODEL_METADATA["main"]["model_version"],
+        selected["model_name"],
+        resolved_model_version,
     )
-    return {"result": float(result)}
+    return {
+        "result": float(result),
+        "model_version": resolved_model_version,
+    }
+
+
+@app.post("/predict_batch")
+def predict_batch(
+    batch_request: BatchTripRequest = Body(
+        ...,
+        example={
+            "trips": [
+                {
+                    "vendor_id": 1,
+                    "pickup_datetime": "2016-06-01 11:07:08",
+                    "passenger_count": 1,
+                    "pickup_longitude": -73.97777557373047,
+                    "pickup_latitude": 40.76396560668945,
+                    "dropoff_longitude": -73.96023559570312,
+                    "dropoff_latitude": 40.77887725830078,
+                    "store_and_fwd_flag": "N",
+                },
+                {
+                    "vendor_id": 2,
+                    "pickup_datetime": "2016-06-04 17:14:35",
+                    "passenger_count": 1,
+                    "pickup_longitude": -73.99095153808594,
+                    "pickup_latitude": 40.73477935791016,
+                    "dropoff_longitude": -73.98129272460938,
+                    "dropoff_latitude": 40.74727249145508,
+                    "store_and_fwd_flag": "N",
+                },
+            ]
+        },
+    ),
+    model_version: str | None = Query(
+        default=None,
+        description="Version du modèle à utiliser. Si absent, la dernière version disponible est utilisée.",
+        examples=["main-2555f607071b", "custom-8833f727d970"],
+    ),
+):
+    """Prédit la durée d'une liste de trajets et renvoie la version du modèle utilisée."""
+    selected, resolved_model_version = _resolve_model_by_version(model_version)
+
+    if not batch_request.trips:
+        return {
+            "predictions": [],
+            "model_version": resolved_model_version,
+        }
+
+    input_data = pd.DataFrame([trip.model_dump() for trip in batch_request.trips])
+    predictions = selected["model"].predict(input_data)
+    predictions_float = [float(value) for value in predictions]
+
+    for trip, prediction in zip(batch_request.trips, predictions_float):
+        _save_prediction(
+            trip,
+            prediction,
+            selected["model_name"],
+            resolved_model_version,
+        )
+
+    return {
+        "predictions": predictions_float,
+        "model_version": resolved_model_version,
+    }
 
 
 @app.post("/predict_custom")
