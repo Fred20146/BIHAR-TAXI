@@ -51,15 +51,58 @@ python -m model.test_model
 Start API:
 
 ```bash
-cd api
-python main.py
+python3 -m uvicorn api.main:app --host 127.0.0.1 --port 8001
+```
+
+Run API in background (keep terminal available):
+
+```bash
+python3 -m uvicorn api.main:app --host 127.0.0.1 --port 8001 > api.log 2>&1 &
+```
+
+Stop API (example):
+
+```bash
+lsof -i :8001
+kill <PID>
 ```
 
 ### Endpoints
 
-- `POST /predict`: returns base model prediction (seconds, float)
-- `POST /predict_custom`: returns custom model prediction (seconds, rounded int)
+- `POST /predict`: returns trip duration prediction + `model_version`
+- `POST /predict_batch`: returns list of predictions + `model_version`
+- `POST /predict_custom`: custom model prediction (legacy endpoint)
 - `GET /trips/randomtest`: returns one random test trip + target value
+- `GET /models/metadata`: returns available model metadata
+- `GET /predictions/recent`: recent prediction logs (optional `model_name`, `limit`)
+- `DELETE /predictions`: delete logs (`confirm=true` required for full deletion)
+
+Validation rules applied at inference time:
+
+- Coordinates must be in NYC bounds:
+  - longitude in `[-74.30, -73.65]`
+  - latitude in `[40.45, 41.05]`
+- Haversine distance between pickup and dropoff must be `> 50m`
+
+## Streamlit frontend
+
+Launch the Streamlit UI, which is fully independent from the training pipeline and only consumes the FastAPI inference service:
+
+```bash
+streamlit run ui/app.py
+```
+
+By default, the UI calls the API at `http://127.0.0.1:8001`. You can change the API URL from the sidebar.
+
+UI highlights:
+
+- Single prediction form with Streamlit widgets (`date_input`, selectboxes, sliders)
+- Error handling for invalid inputs and API failures
+- Result card with:
+  - predicted duration (`HH:mm:ss`)
+  - estimated distance
+  - `model_version` used by the API
+- Interactive map visualization of pickup/dropoff and current route segment (driven by sliders)
 
 Request body example for prediction endpoints:
 
@@ -75,3 +118,13 @@ Request body example for prediction endpoints:
   "store_and_fwd_flag": "N"
 }
 ```
+
+## Quick Validation Checklist
+
+1. Start API on port `8001`
+2. Start UI with `streamlit run ui/app.py`
+3. Make one valid prediction and verify:
+   - duration displayed in `HH:mm:ss`
+   - model version displayed
+4. Try a too-short trip (`<= 50m`) and verify user-friendly error message
+5. Move sliders and verify route segment updates on map

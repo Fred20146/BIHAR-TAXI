@@ -22,6 +22,10 @@ MODEL_PATH = config.CONFIG["paths"]["model_path"]
 MODEL_CUSTOM_PATH = config.CONFIG["paths"]["model_custom_path"]
 
 MIN_TRIP_DISTANCE_METERS = 50.0
+NYC_MIN_LONGITUDE = -74.30
+NYC_MAX_LONGITUDE = -73.65
+NYC_MIN_LATITUDE = 40.45
+NYC_MAX_LATITUDE = 41.05
 
 app = FastAPI()
 
@@ -249,8 +253,10 @@ class Trip(BaseModel):
     )
     @classmethod
     def validate_longitude(cls, value: float):
-        if not -180.0 <= value <= 180.0:
-            raise ValueError("La longitude doit être comprise entre -180 et 180.")
+        if not NYC_MIN_LONGITUDE <= value <= NYC_MAX_LONGITUDE:
+            raise ValueError(
+                f"La longitude doit être dans la zone de New York [{NYC_MIN_LONGITUDE}, {NYC_MAX_LONGITUDE}]."
+            )
         return value
 
     @field_validator(
@@ -259,8 +265,10 @@ class Trip(BaseModel):
     )
     @classmethod
     def validate_latitude(cls, value: float):
-        if not -90.0 <= value <= 90.0:
-            raise ValueError("La latitude doit être comprise entre -90 et 90.")
+        if not NYC_MIN_LATITUDE <= value <= NYC_MAX_LATITUDE:
+            raise ValueError(
+                f"La latitude doit être dans la zone de New York [{NYC_MIN_LATITUDE}, {NYC_MAX_LATITUDE}]."
+            )
         return value
 
     @model_validator(mode="after")
