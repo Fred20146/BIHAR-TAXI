@@ -3,11 +3,12 @@ import os
 import sys
 import dill
 import pickle
+from math import asin, cos, radians, sin, sqrt
 
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if ROOT_DIR not in sys.path:
@@ -18,6 +19,8 @@ from . import config
 DB_PATH = config.CONFIG["paths"]["db_path"]
 MODEL_PATH = config.CONFIG["paths"]["model_path"]
 MODEL_CUSTOM_PATH = config.CONFIG["paths"]["model_custom_path"]
+
+MIN_TRIP_DISTANCE_METERS = 50.0
 
 app = FastAPI()
 
@@ -105,6 +108,48 @@ class Trip(BaseModel):
     dropoff_longitude: float
     dropoff_latitude: float
     store_and_fwd_flag: str
+
+    @field_validator(
+        "pickup_longitude",
+        "dropoff_longitude",
+    )
+    @classmethod
+    def validate_longitude(cls, value: float):
+        if not -180.0 <= value <= 180.0:
+            raise ValueError("La longitude doit être comprise entre -180 et 180.")
+        return value
+
+    @field_validator(
+        "pickup_latitude",
+        "dropoff_latitude",
+    )
+    @classmethod
+    def validate_latitude(cls, value: float):
+        if not -90.0 <= value <= 90.0:
+            raise ValueError("La latitude doit être comprise entre -90 et 90.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_trip_distance(self):
+        """Vérifie que le trajet n'est pas trop court pour être exploitable."""
+        earth_radius_meters = 6371000.0
+        lat1 = radians(self.pickup_latitude)
+        lon1 = radians(self.pickup_longitude)
+        lat2 = radians(self.dropoff_latitude)
+        lon2 = radians(self.dropoff_longitude)
+
+        delta_lat = lat2 - lat1
+        delta_lon = lon2 - lon1
+        haversine = 2 * earth_radius_meters * asin(
+            sqrt(
+                sin(delta_lat / 2) ** 2
+                + cos(lat1) * cos(lat2) * sin(delta_lon / 2) ** 2
+            )
+        )
+
+        if haversine <= MIN_TRIP_DISTANCE_METERS:
+            raise ValueError("La distance entre pickup et dropoff doit être supérieure à 50 mètres.")
+        return self
 
 
 @app.get("/")
