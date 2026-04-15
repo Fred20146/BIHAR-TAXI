@@ -43,68 +43,133 @@ CSV_REQUIRED_COLUMNS = [
 
 st.set_page_config(page_title="BIHAR-TAXI Predictor", page_icon="🚕", layout="wide")
 
+# URL directe du pont de Brooklyn illuminé de nuit
+hero_bg_url = 'url("https://upload.wikimedia.org/wikipedia/commons/thumb/e/e2/Pont_de_Brooklyn_de_nuit_-_Octobre_2008_edit.jpg/1920px-Pont_de_Brooklyn_de_nuit_-_Octobre_2008_edit.jpg")'
+
 st.markdown(
-    """
+    f"""
     <style>
-    .block-container {
+    .stApp {{
+        background:
+            radial-gradient(circle at 10% 10%, rgba(14, 116, 144, 0.16), transparent 42%),
+            radial-gradient(circle at 90% 0%, rgba(16, 185, 129, 0.11), transparent 34%),
+            linear-gradient(180deg, #0b1220 0%, #101a2d 55%, #16253d 100%);
+        color: #e5e7eb;
+    }}
+    .stApp h1,
+    .stApp h2,
+    .stApp h3,
+    .stApp label,
+    .stApp [data-testid="stMarkdownContainer"] p,
+    .stApp [data-testid="stMarkdownContainer"] li,
+    .stApp [data-testid="stCaptionContainer"] {{
+        color: #e5e7eb;
+    }}
+    .block-container {{
         padding-top: 1.5rem;
         padding-bottom: 2rem;
         max-width: 1200px;
-    }
-    .hero {
-        background: linear-gradient(135deg, #0f172a 0%, #1e293b 55%, #334155 100%);
+    }}
+    [data-testid="stSidebar"] {{
+        border-right: 1px solid rgba(255, 255, 255, 0.18);
+    }}
+    [data-testid="stSidebar"] > div:first-child {{
+        background-image:
+            linear-gradient(180deg, rgba(2, 6, 23, 0.70) 0%, rgba(15, 23, 42, 0.75) 40%, rgba(30, 41, 59, 0.80) 100%),
+            url("https://upload.wikimedia.org/wikipedia/commons/a/a1/Statue_of_Liberty_7.jpg");
+        background-size: cover;
+        background-position: center;
+        color: #f8fafc;
+    }}
+    [data-testid="stSidebar"] * {{
+        color: #f8fafc;
+    }}
+    [data-testid="stSidebar"] .stTextInput > div > div,
+    [data-testid="stSidebar"] .stSelectbox > div > div,
+    [data-testid="stSidebar"] .stRadio > div,
+    [data-testid="stSidebar"] .stButton > button {{
+        background: rgba(15, 23, 42, 0.72);
+        border: 1px solid rgba(203, 213, 225, 0.25);
+        border-radius: 12px;
+    }}
+    [data-testid="stSidebar"] .stButton > button:hover {{
+        border-color: rgba(125, 211, 252, 0.8);
+        box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.3), 0 10px 22px rgba(2, 132, 199, 0.25);
+    }}
+    .hero {{
+        background:
+            linear-gradient(135deg, rgba(15, 23, 42, 0.55) 0%, rgba(30, 41, 59, 0.50) 55%, rgba(51, 65, 85, 0.50) 100%),
+            {hero_bg_url};
+        background-size: cover;
+        background-position: center;
         color: white;
         padding: 1.5rem 1.75rem;
         border-radius: 18px;
         margin-bottom: 1.25rem;
         box-shadow: 0 18px 45px rgba(15, 23, 42, 0.22);
-    }
-    .hero h1 {
+    }}
+    .hero h1 {{
         margin: 0;
         font-size: 2rem;
-    }
-    .hero p {
+    }}
+    .hero p {{
         margin: 0.35rem 0 0;
         opacity: 0.88;
         font-size: 0.98rem;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #111827 0%, #1f2937 100%);
+    }}
+    .metric-card {{
+        background: linear-gradient(150deg, #0b1220 0%, #172235 65%, #22304a 100%);
         color: #f8fafc;
-        border: 1px solid #334155;
+        border: 1px solid rgba(148, 163, 184, 0.35);
         border-radius: 16px;
         padding: 1rem 1.1rem;
         box-shadow: 0 14px 30px rgba(15, 23, 42, 0.18);
-    }
+    }}
     .metric-card h3,
     .metric-card p,
-    .metric-card strong {
+    .metric-card strong {{
         color: #f8fafc;
-    }
-    .metric-value {
+    }}
+    .metric-value {{
         margin: 0;
         font-size: 1.05rem;
         color: #f8fafc;
-    }
-    .metric-label {
+    }}
+    .metric-label {{
         margin: 0.4rem 0 0;
         color: #cbd5e1;
-    }
-    .small-note {
-        color: #64748b;
+    }}
+    .small-note {{
+        color: #cbd5e1;
         font-size: 0.9rem;
-    }
-    .validation-card {
+    }}
+    .validation-card {{
         background: linear-gradient(135deg, #7f1d1d 0%, #991b1b 100%);
         color: #fee2e2;
         border: 1px solid #fecaca;
         border-radius: 14px;
         padding: 0.85rem 1rem;
         box-shadow: 0 10px 24px rgba(127, 29, 29, 0.25);
-    }
-    .validation-card strong {
+    }}
+    .validation-card strong {{
         color: #ffffff;
-    }
+    }}
+    .stButton > button[kind="primary"] {{
+        background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+        border: none;
+        color: white;
+        font-weight: 600;
+        border-radius: 12px;
+        box-shadow: 0 10px 24px rgba(14, 165, 233, 0.35);
+    }}
+    .stButton > button[kind="primary"]:hover {{
+        background: linear-gradient(135deg, #38bdf8 0%, #0ea5e9 100%);
+    }}
+    [data-testid="stDataFrame"] {{
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid rgba(148, 163, 184, 0.3);
+    }}
     </style>
     """,
     unsafe_allow_html=True,
