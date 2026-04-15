@@ -24,6 +24,15 @@ NYC_MIN_LONGITUDE = -74.30
 NYC_MAX_LONGITUDE = -73.65
 NYC_MIN_LATITUDE = 40.45
 NYC_MAX_LATITUDE = 41.05
+NYC_VIEWBOX = (-74.2591, 40.9176, -73.7004, 40.4774)
+NYC_ADDRESS_SUGGESTIONS = [
+    "Times Square, Manhattan, New York, NY",
+    "Central Park, Manhattan, New York, NY",
+    "Brooklyn Bridge, New York, NY",
+    "Penn Station, Manhattan, New York, NY",
+    "JFK Airport, Queens, New York, NY",
+    "Wall Street, Manhattan, New York, NY",
+]
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.normpath(os.path.join(ROOT_DIR, ".."))
@@ -297,7 +306,6 @@ def build_trip_deck(pickup_lat: float, pickup_lon: float, dropoff_lat: float, dr
         layers=layers,
         initial_view_state=view_state,
         map_style="mapbox://styles/mapbox/light-v10",
-        tooltip={"text": "{name}"},
     )
 
 
@@ -307,9 +315,9 @@ def fetch_model_metadata(api_base_url: str):
         metadata_payload = api_request(api_base_url, "/models/metadata")
         return metadata_payload, None
     except requests.exceptions.HTTPError as http_error:
-        error_response = http_error.response
-        error_status_code = error_response.status_code if error_response is not None else "?"
-        details = error_response.text if error_response is not None else ""
+        metadata_error_response = http_error.response
+        error_status_code = metadata_error_response.status_code if metadata_error_response is not None else "?"
+        details = metadata_error_response.text if metadata_error_response is not None else ""
         return None, f"HTTP {error_status_code} sur /models/metadata {details}".strip()
     except (requests.exceptions.RequestException, ValueError):
         return None, "Impossible de joindre l'API ou réponse JSON invalide."
@@ -404,6 +412,53 @@ def normalize_csv_payload(frame: pd.DataFrame) -> list[dict]:
     return normalized.to_dict(orient="records")
 
 
+def geocode_nyc_address(address_text: str | None):
+    """Géocode une adresse NYC en limitant la recherche au périmètre new-yorkais."""
+    cleaned_address = (address_text or "").strip()
+    if not cleaned_address:
+        return None, "Adresse vide"
+
+    try:
+        geocode_response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": cleaned_address,
+                "format": "jsonv2",
+                "addressdetails": 1,
+                "limit": 5,
+                "bounded": 1,
+                "viewbox": f"{NYC_VIEWBOX[0]},{NYC_VIEWBOX[1]},{NYC_VIEWBOX[2]},{NYC_VIEWBOX[3]}",
+            },
+            headers={"User-Agent": "BIHAR-TAXI-Streamlit/1.0"},
+            timeout=20,
+        )
+        geocode_response.raise_for_status()
+        candidates = geocode_response.json()
+    except requests.exceptions.RequestException:
+        return None, "Géocodage indisponible"
+    except ValueError:
+        return None, "Réponse de géocodage invalide"
+
+    if not candidates:
+        return None, "Aucun résultat trouvé"
+
+    best_match = candidates[0]
+    try:
+        latitude = float(best_match["lat"])
+        longitude = float(best_match["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None, "Résultat de géocodage incomplet"
+
+    if not (NYC_MIN_LONGITUDE <= longitude <= NYC_MAX_LONGITUDE and NYC_MIN_LATITUDE <= latitude <= NYC_MAX_LATITUDE):
+        return None, "Adresse hors zone New York"
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "display_name": best_match.get("display_name", cleaned_address),
+    }, None
+
+
 st.markdown(
     """
     <div class="hero">
@@ -465,11 +520,32 @@ with st.sidebar:
         st.caption("Métadonnées modèles indisponibles actuellement.")
 
 if current_page == "Prédiction":
+    if "pickup_geo" not in st.session_state:
+        st.session_state["pickup_geo"] = None
+    if "dropoff_geo" not in st.session_state:
+        st.session_state["dropoff_geo"] = None
+    if "pickup_address_raw" not in st.session_state:
+        st.session_state["pickup_address_raw"] = ""
+    if "dropoff_address_raw" not in st.session_state:
+        st.session_state["dropoff_address_raw"] = ""
+    if "input_mode" not in st.session_state:
+        st.session_state["input_mode"] = "adresse"
+
     col1, col2 = st.columns([1.1, 0.9], gap="large")
 
     with col1:
         st.subheader("Entrée de prédiction")
         vendor_id = st.selectbox("vendor_id", options=[1, 2], index=0)
+        vendor_id_value = int(vendor_id or 1)
+
+        input_mode = st.radio(
+            "Mode de saisie",
+            options=["adresse", "coordonnées"],
+            index=0 if st.session_state["input_mode"] == "adresse" else 1,
+            horizontal=True,
+            help="Choisis soit des adresses guidées, soit la saisie manuelle des coordonnées GPS.",
+        )
+        st.session_state["input_mode"] = input_mode
 
         now = datetime.now()
         st.markdown("**pickup_datetime**")
@@ -495,144 +571,260 @@ if current_page == "Prédiction":
 
         pickup_datetime = f"{pickup_date:%Y-%m-%d} {pickup_hour:02d}:{pickup_minute:02d}:00"
         passenger_count = st.slider("passenger_count", min_value=0, max_value=9, value=1, step=1)
-        pickup_longitude = st.slider(
-            "pickup_longitude",
-            min_value=NYC_MIN_LONGITUDE,
-            max_value=NYC_MAX_LONGITUDE,
-            value=-73.98,
-            step=0.0001,
-            format="%.4f",
-        )
-        pickup_latitude = st.slider(
-            "pickup_latitude",
-            min_value=NYC_MIN_LATITUDE,
-            max_value=NYC_MAX_LATITUDE,
-            value=40.75,
-            step=0.0001,
-            format="%.4f",
-        )
-        dropoff_longitude = st.slider(
-            "dropoff_longitude",
-            min_value=NYC_MIN_LONGITUDE,
-            max_value=NYC_MAX_LONGITUDE,
-            value=-73.96,
-            step=0.0001,
-            format="%.4f",
-        )
-        dropoff_latitude = st.slider(
-            "dropoff_latitude",
-            min_value=NYC_MIN_LATITUDE,
-            max_value=NYC_MAX_LATITUDE,
-            value=40.77,
-            step=0.0001,
-            format="%.4f",
-        )
-        store_and_fwd_flag = st.selectbox("store_and_fwd_flag", options=["N", "Y"], index=0)
+        pickup_geo = None
+        dropoff_geo = None
+        pickup_coords_ready = False
+        dropoff_coords_ready = False
 
+        if input_mode == "adresse":
+            st.markdown("**Adresse de départ**")
+            pickup_address_suggestion = st.selectbox(
+                "Adresse de départ courante",
+                options=NYC_ADDRESS_SUGGESTIONS,
+                index=0,
+                help="Choisis un point courant pour éviter les erreurs de frappe.",
+            )
+            pickup_address = st.text_input(
+                "Adresse de départ",
+                value=pickup_address_suggestion,
+                placeholder="Ex: 11 Wall St, New York, NY",
+            )
+
+            st.markdown("**Adresse d'arrivée**")
+            dropoff_address_suggestion = st.selectbox(
+                "Adresse d'arrivée courante",
+                options=NYC_ADDRESS_SUGGESTIONS,
+                index=2,
+                help="Choisis un point courant pour éviter les erreurs de frappe.",
+            )
+            dropoff_address = st.text_input(
+                "Adresse d'arrivée",
+                value=dropoff_address_suggestion,
+                placeholder="Ex: 1 Centre St, New York, NY",
+            )
+
+            if st.session_state["pickup_address_raw"] != pickup_address:
+                st.session_state["pickup_geo"] = None
+                st.session_state["pickup_address_raw"] = pickup_address
+            if st.session_state["dropoff_address_raw"] != dropoff_address:
+                st.session_state["dropoff_geo"] = None
+                st.session_state["dropoff_address_raw"] = dropoff_address
+
+            geocode_cols = st.columns(2)
+            with geocode_cols[0]:
+                resolve_pickup = st.button("Valider départ", use_container_width=True)
+            with geocode_cols[1]:
+                resolve_dropoff = st.button("Valider arrivée", use_container_width=True)
+
+            if resolve_pickup:
+                pickup_geo, pickup_error = geocode_nyc_address(pickup_address)
+                st.session_state["pickup_geo"] = pickup_geo
+                if pickup_error:
+                    st.error(f"Départ: {pickup_error}")
+                elif pickup_geo:
+                    st.success(f"Départ validé: {pickup_geo['display_name']}")
+
+            if resolve_dropoff:
+                dropoff_geo, dropoff_error = geocode_nyc_address(dropoff_address)
+                st.session_state["dropoff_geo"] = dropoff_geo
+                if dropoff_error:
+                    st.error(f"Arrivée: {dropoff_error}")
+                elif dropoff_geo:
+                    st.success(f"Arrivée validée: {dropoff_geo['display_name']}")
+
+            pickup_geo = st.session_state.get("pickup_geo")
+            dropoff_geo = st.session_state.get("dropoff_geo")
+
+            if pickup_geo:
+                st.caption(f"Départ: {pickup_geo['display_name']} ({pickup_geo['latitude']:.5f}, {pickup_geo['longitude']:.5f})")
+            if dropoff_geo:
+                st.caption(f"Arrivée: {dropoff_geo['display_name']} ({dropoff_geo['latitude']:.5f}, {dropoff_geo['longitude']:.5f})")
+
+            pickup_coords_ready = bool(pickup_geo)
+            dropoff_coords_ready = bool(dropoff_geo)
+
+        else:
+            pickup_longitude = st.slider(
+                "pickup_longitude",
+                min_value=NYC_MIN_LONGITUDE,
+                max_value=NYC_MAX_LONGITUDE,
+                value=-73.98,
+                step=0.0001,
+                format="%.4f",
+            )
+            pickup_latitude = st.slider(
+                "pickup_latitude",
+                min_value=NYC_MIN_LATITUDE,
+                max_value=NYC_MAX_LATITUDE,
+                value=40.75,
+                step=0.0001,
+                format="%.4f",
+            )
+            dropoff_longitude = st.slider(
+                "dropoff_longitude",
+                min_value=NYC_MIN_LONGITUDE,
+                max_value=NYC_MAX_LONGITUDE,
+                value=-73.96,
+                step=0.0001,
+                format="%.4f",
+            )
+            dropoff_latitude = st.slider(
+                "dropoff_latitude",
+                min_value=NYC_MIN_LATITUDE,
+                max_value=NYC_MAX_LATITUDE,
+                value=40.77,
+                step=0.0001,
+                format="%.4f",
+            )
+
+            pickup_geo = {
+                "latitude": float(pickup_latitude),
+                "longitude": float(pickup_longitude),
+                "display_name": "Coordonnées pickup",
+            }
+            dropoff_geo = {
+                "latitude": float(dropoff_latitude),
+                "longitude": float(dropoff_longitude),
+                "display_name": "Coordonnées dropoff",
+            }
+            pickup_coords_ready = True
+            dropoff_coords_ready = True
+
+        store_and_fwd_flag = st.selectbox("store_and_fwd_flag", options=["N", "Y"], index=0)
         submitted = st.button("Prédire", type="primary")
 
-        st.markdown('<p class="small-note">Astuce: gardez une distance pickup/dropoff supérieure à 50 m pour passer la validation API.</p>', unsafe_allow_html=True)
+        if input_mode == "adresse":
+            st.markdown(
+                '<p class="small-note">Astuce: sélectionne une adresse connue puis clique sur “Résoudre”. Les adresses hors New York sont refusées automatiquement.</p>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<p class="small-note">Astuce: reste dans la zone New York et garde une distance supérieure à 50 m pour éviter la validation API.</p>',
+                unsafe_allow_html=True,
+            )
 
     with col2:
         st.subheader("Résultat")
-        trip_distance_m = haversine_meters(
-            float(pickup_latitude),
-            float(pickup_longitude),
-            float(dropoff_latitude),
-            float(dropoff_longitude),
-        )
-        trip_distance_display = format_distance(trip_distance_m)
+        if pickup_coords_ready and dropoff_coords_ready:
+            assert pickup_geo is not None and dropoff_geo is not None
+            trip_distance_m = haversine_meters(
+                float(pickup_geo["latitude"]),
+                float(pickup_geo["longitude"]),
+                float(dropoff_geo["latitude"]),
+                float(dropoff_geo["longitude"]),
+            )
+            trip_distance_display = format_distance(trip_distance_m)
+        else:
+            trip_distance_m = 0.0
+            trip_distance_display = "en attente de validation"
 
         if submitted:
-            request_body = {
-                "vendor_id": int(vendor_id),
-                "pickup_datetime": pickup_datetime,
-                "passenger_count": int(passenger_count),
-                "pickup_longitude": float(pickup_longitude),
-                "pickup_latitude": float(pickup_latitude),
-                "dropoff_longitude": float(dropoff_longitude),
-                "dropoff_latitude": float(dropoff_latitude),
-                "store_and_fwd_flag": store_and_fwd_flag,
-            }
-
-            query = {}
-            if model_version and model_version != "latest":
-                query["model_version"] = model_version
-
-            if trip_distance_m <= 50:
+            if not pickup_coords_ready or not dropoff_coords_ready:
                 st.markdown(
                     """
                     <div class="validation-card">
-                        <strong>Validation entrée</strong><br>
-                        La distance de la course ne peut être inférieure à 50 m.
+                        <strong>Validation adresse</strong><br>
+                        Valides d'abord l'adresse de départ et l'adresse d'arrivée avant de lancer la prédiction.
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
-                st.caption(f"Distance calculée: {trip_distance_display}")
             else:
-                path = "/predict"
-                if query:
-                    from urllib.parse import urlencode
+                assert pickup_geo is not None and dropoff_geo is not None
+                request_body = {
+                    "vendor_id": vendor_id_value,
+                    "pickup_datetime": pickup_datetime,
+                    "passenger_count": int(passenger_count),
+                    "pickup_longitude": float(pickup_geo["longitude"]),
+                    "pickup_latitude": float(pickup_geo["latitude"]),
+                    "dropoff_longitude": float(dropoff_geo["longitude"]),
+                    "dropoff_latitude": float(dropoff_geo["latitude"]),
+                    "store_and_fwd_flag": store_and_fwd_flag,
+                }
 
-                    path = f"{path}?{urlencode(query)}"
+                query = {}
+                if model_version and model_version != "latest":
+                    query["model_version"] = model_version
 
-                try:
-                    api_response, used_api_url = predict_with_fallback(api_url, path, request_body)
-                    if used_api_url != api_url:
-                        st.session_state["detected_api_url"] = used_api_url
-                        st.info(f"API indisponible sur {api_url}. Bascule automatique sur {used_api_url}.")
-                    display_model_version = api_response.get("model_version", "non fourni par l'API")
-                    display_model_name = model_name_by_version.get(display_model_version)
-                    if not display_model_name and isinstance(display_model_version, str) and "-" in display_model_version:
-                        display_model_name = display_model_version.split("-", 1)[0]
-                    if not display_model_name:
-                        display_model_name = "non fourni par l'API"
+                if trip_distance_m <= 50:
                     st.markdown(
-                        f"""
-                        <div class="metric-card">
-                            <h3 style="margin-top:0; margin-bottom:0.4rem;">Prédiction reçue</h3>
-                            <p class="metric-value"><strong>Durée estimée:</strong> {format_seconds_hms(api_response['result'])}</p>
-                            <p class="metric-label"><strong>Distance estimée:</strong> {trip_distance_display}</p>
-                            <p class="metric-label"><strong>Nom du modèle:</strong> {display_model_name}</p>
+                        """
+                        <div class="validation-card">
+                            <strong>Validation entrée</strong><br>
+                            La distance de la course ne peut être inférieure à 50 m.
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
-                    st.caption("Réponse brute de l'API")
-                    st.json(api_response)
-                except requests.exceptions.HTTPError as error:
-                    response = error.response
-                    status_code = response.status_code if response is not None else 500
-                    detail_message = "Entrée invalide. Vérifiez les coordonnées et la distance minimale de 50 m."
-                    if response is not None:
-                        try:
-                            payload = response.json()
-                            if isinstance(payload, dict) and payload.get("detail"):
-                                detail_message = str(payload.get("detail"))
-                        except ValueError:
-                            if response.text:
-                                detail_message = response.text
-                    st.error(f"Erreur API ({status_code})")
-                    st.warning(detail_message)
-                except requests.exceptions.RequestException as error:
-                    st.error("Impossible de joindre l'API configurée et aucune API locale n'a été trouvée.")
-                    st.code(str(error))
-                    st.caption("Conseil: vérifiez le port de l'API dans la sidebar ou cliquez sur 'Auto-détecter API locale'.")
-        else:
-            st.info("Renseignez les champs: la carte ci-dessous se met à jour en temps réel. Cliquez sur Prédire pour lancer l'inférence.")
+                    st.caption(f"Distance calculée: {trip_distance_display}")
+                else:
+                    path = "/predict"
+                    if query:
+                        from urllib.parse import urlencode
+
+                        path = f"{path}?{urlencode(query)}"
+
+                    try:
+                        api_response, used_api_url = predict_with_fallback(api_url, path, request_body)
+                        if used_api_url != api_url:
+                            st.session_state["detected_api_url"] = used_api_url
+                            st.info(f"API indisponible sur {api_url}. Bascule automatique sur {used_api_url}.")
+                        display_model_version = api_response.get("model_version", "non fourni par l'API")
+                        display_model_name = model_name_by_version.get(display_model_version)
+                        if not display_model_name and isinstance(display_model_version, str) and "-" in display_model_version:
+                            display_model_name = display_model_version.split("-", 1)[0]
+                        if not display_model_name:
+                            display_model_name = "non fourni par l'API"
+                        st.markdown(
+                            f"""
+                            <div class="metric-card">
+                                <h3 style="margin-top:0; margin-bottom:0.4rem;">Prédiction reçue</h3>
+                                <p class="metric-value"><strong>Durée estimée:</strong> {format_seconds_hms(api_response['result'])}</p>
+                                <p class="metric-label"><strong>Distance estimée:</strong> {trip_distance_display}</p>
+                                <p class="metric-label"><strong>Nom du modèle:</strong> {display_model_name}</p>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        st.caption("Réponse brute de l'API")
+                        st.json(api_response)
+                    except requests.exceptions.HTTPError as error:
+                        error_response = error.response
+                        status_code = error_response.status_code if error_response is not None else 500
+                        detail_message = "Entrée invalide. Vérifiez les adresses et la distance minimale de 50 m."
+                        if error_response is not None:
+                            try:
+                                payload = error_response.json()
+                                if isinstance(payload, dict) and payload.get("detail"):
+                                    detail_message = str(payload.get("detail"))
+                            except ValueError:
+                                if error_response.text:
+                                    detail_message = error_response.text
+                        st.error(f"Erreur API ({status_code})")
+                        st.warning(detail_message)
+                    except requests.exceptions.RequestException as error:
+                        st.error("Impossible de joindre l'API configurée et aucune API locale n'a été trouvée.")
+                        st.code(str(error))
 
         st.divider()
         st.subheader("Carte du trajet sélectionné")
         st.caption(f"Distance actuelle: {trip_distance_display}")
-        trip_deck = build_trip_deck(
-            float(pickup_latitude),
-            float(pickup_longitude),
-            float(dropoff_latitude),
-            float(dropoff_longitude),
-        )
-        st.pydeck_chart(trip_deck, use_container_width=True)
-        st.caption("La carte suit en direct les valeurs des sliders (pickup/dropoff). Points non déplaçables.")
+        if pickup_coords_ready and dropoff_coords_ready:
+            assert pickup_geo is not None and dropoff_geo is not None
+            trip_deck = build_trip_deck(
+                float(pickup_geo["latitude"]),
+                float(pickup_geo["longitude"]),
+                float(dropoff_geo["latitude"]),
+                float(dropoff_geo["longitude"]),
+            )
+            st.pydeck_chart(trip_deck, use_container_width=True)
+            if input_mode == "adresse":
+                st.caption("La carte se base sur les adresses résolues. Les points ne sont pas déplaçables.")
+            else:
+                st.caption("La carte se base sur les coordonnées saisies manuellement.")
+        else:
+            st.info("Valides les deux adresses pour afficher la carte du trajet.")
 
     st.divider()
     st.subheader("Exemple de charge utile")
