@@ -7,7 +7,7 @@ Recreation of the same MLOps structure as the reference repository, adapted to t
 - `data/download_data.py`: downloads and stores the dataset in SQLite (`data/taxi.db`)
 - `model/load_data.py`: data access layer for train/test/random samples
 - `model/features.py`: feature engineering inspired by the Colab tasks
-- `model/train.py`: trains and saves the base model (`models/taxi.model`)
+- `model/train.py`: compares several MLflow runs, registers the best model, and saves the selected base model (`models/taxi.model`)
 - `model/train_custom_model.py`: trains and saves the custom wrapped model (`models/taxi_custom.model`)
 - `model/test_model.py`: loads and tests both models on random test rows
 - `api/main.py`: FastAPI service for inference
@@ -33,6 +33,8 @@ python -m data.download_data
 ```bash
 python -m model.train
 ```
+
+This step now creates several MLflow runs with different regressors and preprocessing variants, then registers the best-performing model in the local MLflow registry.
 
 ### 4. Train and save the custom model
 
@@ -83,6 +85,20 @@ Validation rules applied at inference time:
   - longitude in `[-74.30, -73.65]`
   - latitude in `[40.45, 41.05]`
 - Haversine distance between pickup and dropoff must be `> 50m`
+
+### MLflow artifacts
+
+The training script stores tracking data and model artifacts locally under `data/mlflow/`.
+
+To inspect the runs, start the MLflow UI from the project root:
+
+```bash
+mlflow ui --backend-store-uri sqlite:///data/mlflow/mlflow.db --port 5000
+```
+
+The FastAPI service now loads the latest registered version of the main model by name from MLflow on startup. If the registry is not available, it falls back to the local pickle file so the service stays usable during setup.
+
+The main prediction endpoints accept an optional `model_version` query parameter. When omitted, the API uses the latest registered version of the main model.
 
 ## Streamlit frontend
 

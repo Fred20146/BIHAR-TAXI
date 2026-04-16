@@ -16,10 +16,18 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from . import config
+from mlflow.exceptions import MlflowException  # pyright: ignore[reportMissingImports]
+from model.mlflow_utils import (
+    configure_mlflow,
+    get_registered_model_name,
+    load_registered_model,
+    snapshot_to_metadata,
+)
 
 DB_PATH = config.CONFIG["paths"]["db_path"]
 MODEL_PATH = config.CONFIG["paths"]["model_path"]
 MODEL_CUSTOM_PATH = config.CONFIG["paths"]["model_custom_path"]
+REGISTERED_MODEL_NAME = get_registered_model_name()
 
 MIN_TRIP_DISTANCE_METERS = 50.0
 NYC_MIN_LONGITUDE = -74.30
@@ -187,9 +195,23 @@ def _save_prediction(trip, prediction: float, model_name: str, model_version: st
     finally:
         con.close()
 
-print(f"Loading the model from {MODEL_PATH}")
-with open(MODEL_PATH, "rb") as model_file:
-    model = pickle.load(model_file)
+
+def _load_primary_model():
+    """Charge le dernier modèle enregistré dans MLflow, avec repli local si nécessaire."""
+    try:
+        configure_mlflow()
+        loaded_model, snapshot = load_registered_model(REGISTERED_MODEL_NAME)
+        metadata = snapshot_to_metadata("main", snapshot)
+        print(f"Loaded MLflow model {REGISTERED_MODEL_NAME} version {snapshot.version}")
+        return loaded_model, metadata
+    except (MlflowException, RuntimeError, FileNotFoundError, OSError, ValueError) as error:
+        print(f"Falling back to local model file {MODEL_PATH}: {error}")
+        with open(MODEL_PATH, "rb") as model_file:
+            fallback_model = pickle.load(model_file)
+        return fallback_model, _build_model_metadata("main", MODEL_PATH)
+
+
+model, primary_model_metadata = _load_primary_model()
 
 print(f"Loading the custom model from {MODEL_CUSTOM_PATH}")
 with open(MODEL_CUSTOM_PATH, "rb") as custom_model_file:
@@ -199,26 +221,20 @@ _ensure_model_registry_table()
 _ensure_predictions_table()
 
 MODEL_METADATA = {
-    "main": _build_model_metadata("main", MODEL_PATH),
+    "main": primary_model_metadata,
     "custom": _build_model_metadata("custom", MODEL_CUSTOM_PATH),
 }
 for model_meta in MODEL_METADATA.values():
     _upsert_model_metadata(model_meta)
 
 LOADED_MODELS_BY_VERSION = {
-    MODEL_METADATA["main"]["model_version"]: {
-        "model_name": "main",
-        "model": model,
-    },
+    MODEL_METADATA["main"]["model_version"]: {"model_name": "main", "model": model},
     MODEL_METADATA["custom"]["model_version"]: {
         "model_name": "custom",
         "model": model_custom,
     },
 }
-LATEST_MODEL_VERSION = max(
-    MODEL_METADATA.values(),
-    key=lambda meta: meta["model_file_mtime"],
-)["model_version"]
+LATEST_MODEL_VERSION = MODEL_METADATA["main"]["model_version"]
 
 
 def _resolve_model_by_version(model_version: str | None):
@@ -226,14 +242,24 @@ def _resolve_model_by_version(model_version: str | None):
     version = model_version or LATEST_MODEL_VERSION
     selected = LOADED_MODELS_BY_VERSION.get(version)
     if selected is None:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "message": "model_version introuvable",
-                "requested_model_version": version,
-                "available_model_versions": sorted(LOADED_MODELS_BY_VERSION.keys()),
-            },
-        )
+        try:
+            loaded_model, snapshot = load_registered_model(REGISTERED_MODEL_NAME, version)
+        except (MlflowException, RuntimeError, FileNotFoundError, OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": "model_version introuvable",
+                    "requested_model_version": version,
+                    "available_model_versions": sorted(LOADED_MODELS_BY_VERSION.keys()),
+                },
+            ) from exc
+        metadata = snapshot_to_metadata("main", snapshot)
+        _upsert_model_metadata(metadata)
+        LOADED_MODELS_BY_VERSION[metadata["model_version"]] = {
+            "model_name": "main",
+            "model": loaded_model,
+        }
+        return LOADED_MODELS_BY_VERSION[metadata["model_version"]], metadata["model_version"]
     return selected, version
 
 
@@ -322,7 +348,7 @@ def predict(
     model_version: str | None = Query(
         default=None,
         description="Version du modèle à utiliser. Si absent, la dernière version disponible est utilisée.",
-        examples=["main-2555f607071b", "custom-8833f727d970"],
+        examples=["1", "2"],
     ),
 ):
     """Prédit la durée d'un trajet et renvoie aussi la version du modèle utilisée."""
@@ -373,7 +399,7 @@ def predict_batch(
     model_version: str | None = Query(
         default=None,
         description="Version du modèle à utiliser. Si absent, la dernière version disponible est utilisée.",
-        examples=["main-2555f607071b", "custom-8833f727d970"],
+        examples=["1", "2"],
     ),
 ):
     """Prédit la durée d'une liste de trajets et renvoie la version du modèle utilisée."""

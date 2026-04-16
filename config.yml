@@ -2,10 +2,17 @@ paths:
   db_path: ./data/taxi.db
   model_path: ./models/taxi.model
   model_custom_path: ./models/taxi_custom.model
+  mlflow_dir: ./data/mlflow
+  mlflow_tracking_db: ./data/mlflow/mlflow.db
+  mlflow_artifacts_dir: ./data/mlflow/artifacts
 
 ml:
   random_state: 42
   test_size: 0.30
+
+mlflow:
+  experiment_name: bihar_taxi_duration_experiments
+  registered_model_name: bihar_taxi_duration_model
 
 data:
   source_url: https://github.com/eishkina-estia/ML2023/raw/main/data/New_York_City_Taxi_Trip_Duration.zip
